@@ -1,0 +1,6 @@
+{
+  "GENAI_KEY": "AIzaSyBm113TWhF_DkUzrsxLm7cf_s0OrhAZE5o",
+
+  "MONGO_URI": "mongodb+srv://mohantmr4114_db_user:1234qwerasdf12@cluster0.u0d2ipe.mongodb.net/?appName=Cluster0",
+  "FLASK_SECRET_KEY": "super_secret_flask_key_123"
+}
