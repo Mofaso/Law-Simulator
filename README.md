@@ -35,13 +35,7 @@ embedding-based law validation, and dynamic societal impact modeling.
 | Auth | bcrypt, RBAC, Session management |
 | Packaging | PyInstaller (Windows .exe) |
 
----
 
-## 📸 Screenshots
-
-[Add 2-3 screenshots here]
-
----
 
 ## ⚙️ Setup
 
