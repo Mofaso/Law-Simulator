@@ -32,6 +32,8 @@ from textblob import TextBlob
 import google.generativeai as genai
 import google.api_core.exceptions # Import specific exception type
 
+from security_config import validate_password, validate_username, validate_email
+
 # ---------------- Helper: resource_path for PyInstaller compatibility ----------------
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller"""
@@ -53,6 +55,9 @@ app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False if app.debug else True,
+    MAX_CONTENT_LENGTH=10 * 1024 * 1024,
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
 )
 
 # ---------------- Load environment (Config File) ----------------
@@ -75,13 +80,52 @@ def load_config():
 
 config = load_config()
 
-GENAI_KEY = config.get("GENAI_KEY")
-MONGO_URI = config.get("MONGO_URI")
-app.secret_key = config.get("FLASK_SECRET_KEY")
+GENAI_KEY = (config.get("GENAI_KEY") or "").strip()
+MONGO_URI = (config.get("MONGO_URI") or "").strip()
+app.secret_key = (config.get("FLASK_SECRET_KEY") or "").strip()
+SESSION_TIMEOUT_MINUTES = int(config.get("SESSION_TIMEOUT_MINUTES", 30))
+MAX_LAW_TEXT_LENGTH = int(config.get("MAX_LAW_TEXT_LENGTH", 10000))
+DEFAULT_ADMIN_USERNAME = (config.get("DEFAULT_ADMIN_USERNAME") or "admin").strip() or "admin"
+DEFAULT_ADMIN_PASSWORD = (config.get("DEFAULT_ADMIN_PASSWORD") or "").strip()
+DB_NAME = "cybercourt"
 
 if not MONGO_URI or not app.secret_key:
     print("❌ CRITICAL: MONGO_URI and FLASK_SECRET_KEY must be set in config.json.")
     sys.exit(1)
+
+# ---------------- Security helpers ----------------
+LOGIN_ATTEMPTS = {}
+
+
+def sanitize_text(value, max_length=10000):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if len(text) > max_length:
+        text = text[:max_length]
+    return text
+
+
+def is_rate_limited(key, limit=5, window_seconds=900):
+    now = time.time()
+    attempts = LOGIN_ATTEMPTS.get(key, [])
+    attempts = [ts for ts in attempts if now - ts < window_seconds]
+    LOGIN_ATTEMPTS[key] = attempts
+    if len(attempts) >= limit:
+        return True
+    attempts.append(now)
+    LOGIN_ATTEMPTS[key] = attempts
+    return False
+
+
+@app.after_request
+def apply_security_headers(response):
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'self'"
+    return response
+
 
 # ---------------- Gemini AI Setup ----------------
 # Global variable for the model instance
@@ -161,14 +205,12 @@ except Exception as e:
     print(f"⚠️ Explainability Init Failed: {e}")
 
 
-
-
 # ---------------- MongoDB Setup ----------------
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     client.server_info()
     print("✅ Connected to MongoDB.")
-    db = client.get_database("cybercourt") # You can change this DB name
+    db = client.get_database(DB_NAME)
     users_collection = db.get_collection("users")
     history_collection = db.get_collection("simulation_history")
 except ServerSelectionTimeoutError:
@@ -217,7 +259,11 @@ def generate_system_id(role):
 
 # -------------------- AUTO-CREATE FIRST ADMIN (ONLY ONCE) --------------------
 def auto_create_initial_admin():
-    """Create the very first admin automatically on first server startup."""
+    """Create the very first admin automatically on first server startup only when explicitly configured."""
+    if not DEFAULT_ADMIN_PASSWORD:
+        print("ℹ️ No DEFAULT_ADMIN_PASSWORD configured. Skipping automatic admin creation.")
+        return
+
     admin_exists = users_collection.find_one({"role": "admin"})
 
     if admin_exists:
@@ -226,33 +272,22 @@ def auto_create_initial_admin():
 
     print("⚠ No admin found. Creating FIRST ADMIN automatically...")
 
-    # Default first admin credentials
-    first_admin_username = "superadmin"
-    first_admin_password = "Admin@123"   # You can change this
-    first_admin_email = "admin@system.local"
-
-    # Generate s_id: ADM001
-    # Now this works because generate_system_id is defined above!
     s_id = generate_system_id("admin")
+    hashed_pw = bcrypt.hashpw(DEFAULT_ADMIN_PASSWORD.encode("utf-8"), bcrypt.gensalt())
 
-    # Hash password
-    hashed_pw = bcrypt.hashpw(first_admin_password.encode(), bcrypt.gensalt())
-
-    # Insert admin into DB
     users_collection.insert_one({
-        "username": first_admin_username,
+        "username": DEFAULT_ADMIN_USERNAME,
         "password": hashed_pw,
-        "email": first_admin_email,
+        "email": "admin@system.local",
         "role": "admin",
         "s_id": s_id,
         "created_at": datetime.now()
     })
 
     print("✅ FIRST ADMIN CREATED SUCCESSFULLY!")
-    print(f"   Username: {first_admin_username}")
+    print(f"   Username: {DEFAULT_ADMIN_USERNAME}")
     print(f"   System ID: {s_id}")
-    print(f"   Password: {first_admin_password}")
-    print("   (Please store these credentials securely.)")
+    print("   Password is provided through the DEFAULT_ADMIN_PASSWORD environment variable.")
 
 # Call auto-creator (Now safe to call)
 auto_create_initial_admin()
@@ -262,6 +297,7 @@ auto_create_initial_admin()
 # MVP: In-memory store of laws and embeddings
 LAWS_DB_PATH = resource_path("laws_db.json")
 law_embeddings = [] # List of {law_id, title, summary, embedding, text}
+
 
 def load_laws_db():
     if not os.path.exists(LAWS_DB_PATH):
@@ -273,6 +309,7 @@ def load_laws_db():
     except Exception as e:
         print(f"❌ CLEV: Error loading laws DB: {e}")
         return []
+
 
 def get_embedding(text):
     """Generate embedding using Gemini API."""
@@ -293,12 +330,13 @@ def get_embedding(text):
         print(f"❌ CLEV: Embedding error: {e}")
         return None
 
+
 def initialize_clev():
     """Load laws and pre-compute embeddings."""
     global law_embeddings
     print("🔐 Initializing CLEV (Constitutional Law Existence Validator)...")
     laws = load_laws_db()
-    
+
     count = 0
     for law in laws:
         # In a real app, we'd cache these embeddings to disk/DB
@@ -309,21 +347,22 @@ def initialize_clev():
             law_embeddings.append(law_entry)
             count += 1
             # Rate limit handling (simple sleep for MVP)
-            time.sleep(0.5) 
-            
+            time.sleep(0.5)
+
     print(f"✅ CLEV initialized with {count} laws.")
+
 
 def cosine_similarity(v1, v2):
     """Compute cosine similarity between two vectors."""
     if not v1 or not v2: return 0.0
-    
+
     dot_product = sum(a*b for a,b in zip(v1, v2))
     magnitude1 = math.sqrt(sum(a*a for a in v1))
     magnitude2 = math.sqrt(sum(b*b for b in v2))
-    
+
     if magnitude1 == 0 or magnitude2 == 0:
         return 0.0
-        
+
     return dot_product / (magnitude1 * magnitude2)
 
 @explainability.explainable("clev_validation")
@@ -357,7 +396,7 @@ def validate_law_existence(user_text, threshold=0.85):
             "similarity_score": round(best_score * 100, 1),
             "match_text": best_match["text"][:200] + "..."
         }, "EXISTING_LAW"
-    
+
     return False, None, "NEW_LAW"
 
 # Initialize CLEV on startup (in background thread ideally, but blocking is safer for MVP correctness)
@@ -365,7 +404,6 @@ if GENAI_KEY:
     # We do this in a thread to not block the whole app startup if it takes time
     import threading
     threading.Thread(target=initialize_clev, daemon=True).start()
-
 
 
 # ---------------- Flask-Login Setup ----------------
@@ -402,8 +440,8 @@ DOMAIN_KEYWORDS = {
 }
 
 VALID_LEGAL_DOMAINS = [
-    "Civil Law", "Criminal Law", "Constitutional Law", "Corporate Law", 
-    "Family Law", "International Law", "Intellectual Property Law", 
+    "Civil Law", "Criminal Law", "Constitutional Law", "Corporate Law",
+    "Family Law", "International Law", "Intellectual Property Law",
     "Labor Law", "Environmental Law", "Other"
 ]
 
@@ -646,14 +684,13 @@ def simulate_law_llm(law_text: str, country: str = None, legal_domain: str = Non
             return fallback_base
         except Exception as impact_err:
             print(f"❌ Error during FULL fallback dynamic impact analysis: {impact_err}")
-            return { "positives": ["Error generating analysis."], "negatives": ["Error generating analysis."], "solutions": [], "impact": {}, "alternative": "Review input.", "risk_score": 5.0, "risk_justification": "Fallback due to multiple errors.", "_detected_domain": "unknown", "_profile": [] }
-
+            return { "positives": ["Error generating analysis."], "negatives": ["Error generating analysis."], "solutions": [], "impact": {}, "alternative": "Review input.", "risk_score": 5.0, "risk_justification": "Review input.", "_detected_domain": "society", "_profile": [] }
 
     # --- Prompt Engineering ---
     # Explicitly binding the model to the context constraints
     jurisdiction_clause = f"JURISDICTION: {country}" if country else "JURISDICTION: International / General"
     domain_clause = f"LEGAL DOMAIN: {legal_domain}" if legal_domain else "LEGAL DOMAIN: General Legal Reasoning"
-    
+
     context_instruction = (
         "You are an expert AI Legal Analyst acting as a Judge's Assistant.\n"
         f"{jurisdiction_clause}\n"
@@ -668,7 +705,7 @@ def simulate_law_llm(law_text: str, country: str = None, legal_domain: str = Non
 {context_instruction}
 
 TASK: Analyze this proposed law/case text:
-\"\"\"{law_text}\"\"\"
+"""{law_text}"""
 
 
 Return ONLY valid JSON (no extra text before or after the JSON object, no markdown ```json).
@@ -775,7 +812,7 @@ Keep alternative and risk_justification brief (1-2 sentences).
         return fallback_base
     except Exception as impact_err:
         print(f"❌ Error during FULL fallback dynamic impact analysis: {impact_err}")
-        return { "positives": ["Error generating analysis."], "negatives": ["Error generating analysis."], "solutions": [], "impact": {}, "alternative": "Review input.", "risk_score": 5.0, "risk_justification": f"Fallback due to multiple errors ({error_message}).", "_detected_domain": "unknown", "_profile": [] }
+        return { "positives": ["Error generating analysis."], "negatives": ["Error generating analysis."], "solutions": [], "impact": {}, "alternative": "Review input.", "risk_score": 5.0, "risk_justification": "Review input.", "_detected_domain": "society", "_profile": [] }
 
 # ---------------- Routes: Signup / Login / Logout ----------------
 @app.route("/signup", methods=["GET", "POST"])
@@ -786,18 +823,32 @@ def signup():
 
     if request.method == "POST":
         role = request.form.get("role")
-        username = request.form.get("username").strip()
-        email = request.form.get("email").strip().lower()
-        password = request.form.get("password")
-        confirm_password = request.form.get("confirm_password")
-        # ONLY normal users can sign up
+        username = sanitize_text(request.form.get("username"), 30)
+        email = sanitize_text(request.form.get("email"), 254).lower()
+        password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
         if role != "user":
             flash("Only User accounts can be created here. Admin/Judge/Lawmaker/Simulator accounts must be created by System Administrator.", "danger")
             return redirect(url_for("signup"))
 
-        # Username validations
-        if not username or len(username) < 3:
-            flash("Username must be at least 3 characters.", "danger")
+        valid_username, err_user = validate_username(username)
+        if not valid_username:
+            flash(err_user, "danger")
+            return redirect(url_for("signup"))
+
+        valid_email, err_email = validate_email(email)
+        if not valid_email:
+            flash(err_email, "danger")
+            return redirect(url_for("signup"))
+
+        if password != confirm_password:
+            flash("Passwords do not match.", "danger")
+            return redirect(url_for("signup"))
+
+        password_ok, password_err = validate_password(password, config)
+        if not password_ok:
+            flash(password_err, "danger")
             return redirect(url_for("signup"))
 
         if users_collection.find_one({"username": username}):
@@ -824,11 +875,17 @@ def signup():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        selected_role = request.form.get("role", "").lower()
+        selected_role = (request.form.get("role", "").lower() or "").strip()
         password = request.form.get("password", "")
+        login_key = request.form.get("username", "") or request.form.get("s_id", "") or "unknown"
+        login_key = sanitize_text(login_key, 128)
+
+        if is_rate_limited(f"{request.remote_addr}:{login_key}", limit=5, window_seconds=900):
+            flash("Too many failed login attempts. Please wait 15 minutes before trying again.", "danger")
+            return render_template("login.html")
 
         if selected_role == "user":
-            username = request.form.get("username", "").strip()
+            username = sanitize_text(request.form.get("username", ""), 30)
             user = users_collection.find_one({"username": username})
 
             if not user:
@@ -837,6 +894,7 @@ def login():
 
             # SMART CHECK: Handles both scrypt and bcrypt automatically
             if verify_password(password, user["password"]):
+                LOGIN_ATTEMPTS.pop(f"{request.remote_addr}:{login_key}", None)
                 login_user(User(user))
                 session.update({"username": username, "role": "user"})
                 flash("Login successful!", "success")
@@ -845,32 +903,28 @@ def login():
                 flash("Incorrect password.", "danger")
 
         else:
-            s_id = request.form.get("s_id", "").strip()
-            # Case-insensitive role check if needed, but DB stores lowercase
+            s_id = sanitize_text(request.form.get("s_id", ""), 30)
             user = users_collection.find_one({"s_id": s_id, "role": selected_role})
 
             if user:
-                # FIX: Use bcrypt to verify password (handles bytes/str automatically)
                 stored_pw = user.get("password")
-                # Ensure stored_pw is bytes for bcrypt
                 if isinstance(stored_pw, str):
                     stored_pw = stored_pw.encode('utf-8')
 
                 try:
                     is_valid = bcrypt.checkpw(password.encode('utf-8'), stored_pw)
                 except ValueError:
-                    # Invalid salt or hash
                     is_valid = False
                 except Exception as e:
                     print(f"❌ Error verifying password: {e}")
                     is_valid = False
 
                 if is_valid:
+                    LOGIN_ATTEMPTS.pop(f"{request.remote_addr}:{login_key}", None)
                     login_user(User(user))
                     session.update({"username": user["username"], "role": selected_role})
                     flash(f"Welcome, {user['username']}!", "success")
-                    
-                    # Redirect based on role
+
                     dashboards = {
                         "admin": "admin_dashboard",
                         "judge": "judge_dashboard",
@@ -906,6 +960,7 @@ def generate_random_password(length=10):
         if (any(c.islower() for c in pwd) and any(c.isupper() for c in pwd)
                 and any(c.isdigit() for c in pwd) and any(c in "!@#$%^&*()-_=+" for c in pwd)):
             return pwd
+
 
 def admin_required(fn):
     """Decorator to restrict route to admin role."""
@@ -975,7 +1030,7 @@ def admin_explanations():
         records = explainability.recorder._load_records()
         return json.dumps(records, indent=2), 200, {'Content-Type': 'application/json'}
     except Exception as e:
-        return f"Error: {e}", 500 
+        return f"Error: {e}", 500
 
 # -------------------- CREATE PRIVILEGED USER --------------------
 @app.route("/admin/create", methods=["POST"])
@@ -987,17 +1042,18 @@ def admin_create_user():
     Each gets: username + s_id + password (auto/manual)
     """
     role = request.form.get("role")
-    username = request.form.get("username", "").strip()
+    username = sanitize_text(request.form.get("username", ""), 30)
     password_choice = request.form.get("password_choice", "auto")
-    manual_password = request.form.get("manual_password", "").strip()
-    email = request.form.get("email", "").strip() or None
+    manual_password = request.form.get("manual_password", "")
+    email = sanitize_text(request.form.get("email", ""), 254).lower() or None
 
     if role not in ROLE_PREFIX:
         flash("Invalid role selected.", "danger")
         return redirect(url_for("admin_dashboard"))
 
-    if not username or not re.match(r"^[a-zA-Z0-9_.-]{3,30}$", username):
-        flash("Invalid username (3-30 chars, letters/numbers/._-).", "danger")
+    username_ok, username_err = validate_username(username)
+    if not username_ok:
+        flash(username_err, "danger")
         return redirect(url_for("admin_dashboard"))
 
     # Username collision check
@@ -1007,10 +1063,11 @@ def admin_create_user():
 
     # Password
     if password_choice == "manual":
-        if len(manual_password) < 6:
-            flash("Manual password too short (min 6).", "danger")
+        password_plain = manual_password.strip()
+        password_ok, password_err = validate_password(password_plain, config)
+        if not password_ok:
+            flash(password_err, "danger")
             return redirect(url_for("admin_dashboard"))
-        password_plain = manual_password
     else:
         password_plain = generate_random_password(12)
 
@@ -1035,7 +1092,7 @@ def admin_create_user():
         return redirect(url_for("admin_dashboard"))
 
     flash(f"Created {role} — username: {username}, system ID: {s_id}", "success")
-    flash(f"Temporary password: {password_plain}", "info")  # show password once
+    flash(f"Temporary password: {password_plain}", "info")
     return redirect(url_for("admin_dashboard"))
 
 # -------------------- DELETE PRIVILEGED USER --------------------
@@ -1080,41 +1137,27 @@ def lawmaker_dashboard():
 
     # When the lawmaker submits draft law text
     if request.method == "POST":
-        law_text = request.form.get("law_text", "").strip()
+        law_text = sanitize_text(request.form.get("law_text", ""), MAX_LAW_TEXT_LENGTH)
 
         if not law_text:
             flash("Please enter law content to analyze.", "danger")
             return render_template("lawmaker_dashboard.html", username=current_user.username)
 
-        # --------------------
-        # AI SUMMARY
-        # --------------------
         summary = summarize_text_llm(law_text)
-
-        # --------------------
-        # AI FULL ANALYSIS
-        # --------------------
         result = simulate_law_llm(law_text)
 
-        # Extract lists
         positives = ", ".join(result.get("positives", []))
         negatives = ", ".join(result.get("negatives", []))
         solutions = ", ".join(result.get("solutions", []))
 
-        # --------------------
-        # RISK SCORE
-        # --------------------
         risk = result.get("risk_score", 6.5)
         try:
             risk = float(risk)
-            risk = max(0.0, min(10.0, risk))  # ensure 0–10
+            risk = max(0.0, min(10.0, risk))
         except:
             risk = 6.5
         risk_score_display = round(risk, 1)
 
-        # --------------------
-        # RECOMMENDATION ENGINE
-        # --------------------
         if risk_score_display <= 3.5:
             recommendation = "This law draft is LOW RISK and likely safe to submit. Proceed confidently. ✅"
         elif 3.5 < risk_score_display <= 6.5:
@@ -1122,9 +1165,6 @@ def lawmaker_dashboard():
         else:
             recommendation = "This draft is HIGH RISK and NOT advisable to submit. Significant revision is needed. ❌"
 
-        # --------------------
-        # RENDER WITH RESULT
-        # --------------------
         return render_template(
             "lawmaker_dashboard.html",
             username=current_user.username,
@@ -1136,7 +1176,6 @@ def lawmaker_dashboard():
             recommendation=recommendation
         )
 
-    # GET request → show empty dashboard
     return render_template("lawmaker_dashboard.html", username=current_user.username)
 
 # ---------------- Simulator Route ----------------
@@ -1152,38 +1191,27 @@ def judge_dashboard():
     risk_score_display = None
     result = None
 
-
     if request.method == "POST":
-        case_text = request.form.get("case_text", "").strip()
-        country_input = request.form.get("country", "").strip()
-        domain_input = request.form.get("domain", "").strip()
+        case_text = sanitize_text(request.form.get("case_text", ""), MAX_LAW_TEXT_LENGTH)
+        country_input = sanitize_text(request.form.get("country", ""), 50)
+        domain_input = sanitize_text(request.form.get("domain", ""), 50)
 
-        # --- Validation & Defaults ---
-        # 1. Country: Defaults to "India" if empty (as mostly local usage), but we allow explicit "None" if needed.
-        # Here we just treat empty as None for the function, letting the Prompt defaults handle it, 
-        # OR we can force "India" if we want to be opinionated. 
-        # Plan says: Default "India" in UI, but if user clears it? Let's use "India" as safe default for this Simulator context.
         country = country_input if country_input else "India"
 
-        # 2. Domain: Whitelist validation
         if domain_input not in VALID_LEGAL_DOMAINS:
-            legal_domain = "General" # Fallback
+            legal_domain = "General"
         else:
             legal_domain = domain_input
-            
+
         if not case_text:
              flash("Please enter case details.", "warning")
-             # RENDER with preserved state even on error
              return render_template("judge_dashboard.html", username=current_user.username, country=country, legal_domain=legal_domain)
 
-        # --- Use real simulation functions ---
         summary = summarize_text_llm(case_text)
         result = simulate_law_llm(case_text, country=country, legal_domain=legal_domain)
 
-        # Risk Score
         risk_score_display = float(result.get("risk_score", 5))
 
-        # ---- Verdict Logic ----
         if risk_score_display <= 3.5:
             verdict = "APPROVED"
             verdict_reason = (
@@ -1205,7 +1233,6 @@ def judge_dashboard():
                 "ethical concerns, or harmful societal impact. Implementation not advised."
             )
 
-    # Render Page with preserved state
     return render_template(
         "judge_dashboard.html",
         username=current_user.username,
@@ -1214,7 +1241,7 @@ def judge_dashboard():
         verdict_reason=verdict_reason,
         result=result,
         risk_score=risk_score_display,
-        country=request.form.get("country", "India"), # Default for first load is India
+        country=request.form.get("country", "India"),
         legal_domain=request.form.get("domain", "")
     )
 
@@ -1222,7 +1249,6 @@ def judge_dashboard():
 @app.route("/simulator", methods=["GET", "POST"])
 @login_required
 def simulator():
-    # Only normal users and simulator-role users can access
     if current_user.role not in ["user", "simulator", "admin", "lawmaker", "judge"]:
         flash("Access denied. Only Users/Simulators can access the AI Simulator.", "danger")
         return redirect(url_for("login"))
@@ -1239,16 +1265,14 @@ def simulator():
     clev_status_tag = None
 
     if request.method == "POST":
-        law_text = request.form.get("law_text", "").strip()
-        country_input = request.form.get("country", "").strip()
+        law_text = sanitize_text(request.form.get("law_text", ""), MAX_LAW_TEXT_LENGTH)
+        country_input = sanitize_text(request.form.get("country", ""), 50)
 
-        # Step 1: Country Validation (Mandatory as per request)
         if not country_input:
-            country_input = "India" # Default to India
-        
-        # Step 2: CLEV (Constitutional Law Existence Validator)
+            country_input = "India"
+
         blocked, match_data, status_tag = validate_law_existence(law_text)
-        
+
         clev_blocked = blocked
         clev_data = match_data
         clev_status_tag = status_tag
@@ -1257,20 +1281,15 @@ def simulator():
             flash("Please enter the law text to simulate.", "warning")
             return render_template("simulator.html", username=current_user.username)
 
-        # Logic Branch: Block vs Allow
         if clev_blocked:
-            # STOP simulation. Show validation error only.
-            summary = summarize_text_llm(law_text) # Still show summary of input
-            # No result, No history save (optional, but keeps history clean)
+            summary = summarize_text_llm(law_text)
         else:
-            # Proceed with simulation
             summary = summarize_text_llm(law_text)
             result = simulate_law_llm(law_text, country=country_input)
 
             risk = float(result.get("risk_score", 6.5))
             risk_score_display = round(max(0.0, min(10.0, risk)), 1)
 
-            # Recommendation
             if risk_score_display <= 3.5:
                 recommendation = "SAFE — This proposal is low risk. Good to proceed. ✅"
             elif risk_score_display <= 6.5:
@@ -1278,7 +1297,6 @@ def simulator():
             else:
                 recommendation = "HIGH RISK — Not recommended for implementation. ❌"
 
-            # 📌 SAVE to history
             history_collection.insert_one({
                 "user_id": current_user.id,
                 "timestamp": datetime.now(),
@@ -1287,7 +1305,6 @@ def simulator():
                 "clev_status": status_tag
             })
 
-    # 📌 FETCH last 10 history items for the logged-in user
     history_cursor = history_collection.find({"user_id": current_user.id}).sort("timestamp", -1).limit(10)
     for item in history_cursor:
         history.append(item)
@@ -1300,7 +1317,7 @@ def simulator():
         risk_score=risk_score_display,
         recommendation_message=recommendation,
         history=history,
-        original_text=law_text, # Preserve input
+        original_text=law_text,
         clev_blocked=clev_blocked,
         clev_data=clev_data,
         clev_status_tag=clev_status_tag,
@@ -1308,7 +1325,7 @@ def simulator():
     )
 
 # ---------------- Session Timeout ----------------
-SESSION_TIMEOUT_MINUTES = 30
+SESSION_TIMEOUT_MINUTES = config.get("SESSION_TIMEOUT_MINUTES", 30)
 
 @app.before_request
 def check_session_timeout():
@@ -1323,7 +1340,7 @@ def check_session_timeout():
                 if last_activity_dt.tzinfo is not None:
                      last_activity_dt = last_activity_dt.replace(tzinfo=None)
 
-                if now - last_activity_dt > timedelta(minutes=SESSION_TIMEOUT_MINUTES):
+                if now - last_activity_dt > timedelta(minutes=int(SESSION_TIMEOUT_MINUTES)):
                     print(f"ℹ️ User '{current_user.username}' timed out due to inactivity.")
                     logout_user()
                     session.clear()
@@ -1565,8 +1582,8 @@ document.addEventListener('DOMContentLoaded', function(){
 if __name__ == "__main__":
     import threading, webbrowser, time
 
-    SERVER_PORT = 5000
-    SERVER_HOST = "127.0.0.1"
+    SERVER_PORT = int(config.get("SERVER_PORT", 5000))
+    SERVER_HOST = config.get("SERVER_HOST", "127.0.0.1")
     SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
     # Auto-open browser when server starts
@@ -1581,6 +1598,6 @@ if __name__ == "__main__":
     app.run(
         host=SERVER_HOST,
         port=SERVER_PORT,
-        debug=True,
+        debug=bool(config.get("FLASK_DEBUG", False)),
         use_reloader=False
     )
