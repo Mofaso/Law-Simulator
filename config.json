@@ -1,6 +1,12 @@
 {
-  "GENAI_KEY": "Fill your GenAI Key",
-
-  "MONGO_URI": "fill your mongo URI key",
-  "FLASK_SECRET_KEY": "super_secret_flask_key_123"
+  "GENAI_KEY": "${GENAI_KEY}",
+  "MONGO_URI": "${MONGO_URI}",
+  "FLASK_SECRET_KEY": "${FLASK_SECRET_KEY}",
+  "FLASK_DEBUG": false,
+  "SESSION_TIMEOUT_MINUTES": 30,
+  "MAX_LAW_TEXT_LENGTH": 10000,
+  "PASSWORD_MIN_LENGTH": 12,
+  "PASSWORD_REQUIRE_UPPERCASE": true,
+  "PASSWORD_REQUIRE_NUMBERS": true,
+  "PASSWORD_REQUIRE_SYMBOLS": true
 }
